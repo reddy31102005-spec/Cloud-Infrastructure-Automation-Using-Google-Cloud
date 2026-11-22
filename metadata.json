@@ -1,0 +1,6 @@
+{
+  "name": "CloudScale GCP Automation",
+  "description": "Google Cloud infrastructure automation workbench for designing scalable Compute Engine, Load Balancer, Managed Instance Group, Autoscaling, Cloud Monitoring, and startup script deployments.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

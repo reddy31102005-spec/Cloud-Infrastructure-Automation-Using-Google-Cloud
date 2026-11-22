@@ -1,0 +1,372 @@
+import { InfraConfig } from '../types/infra';
+import { MACHINE_SPECS } from '../data/presets';
+
+export function generateGcloudScript(c: InfraConfig): string {
+  const spec = MACHINE_SPECS[c.machineType];
+  const zonesCsv = c.zones.join(',');
+  const proxyResource = c.lbProtocol === 'HTTPS' ? 'target-https-proxies' : 'target-http-proxies';
+  const forwardingPort = c.lbProtocol === 'HTTPS' ? '443' : '80';
+
+  const autoscalingFlag =
+    c.autoscalingMetric === 'cpu'
+      ? `--target-cpu-utilization=${c.targetCpuUtilization.toFixed(2)}`
+      : `--target-load-balancing-utilization=${c.targetLbUtilization.toFixed(2)}`;
+
+  return `#!/usr/bin/env bash
+# Automated Google Cloud Scalable Infrastructure Provisioning
+# Project: ${c.projectId} | Region: ${c.region} | Version: ${c.appVersion}
+set -euo pipefail
+
+PROJECT_ID="${c.projectId}"
+REGION="${c.region}"
+NETWORK="${c.networkName}"
+SUBNET="${c.subnetName}"
+
+gcloud config set project "$PROJECT_ID"
+
+# 1. Write Startup Script payload for Compute Engine metadata
+cat <<'STARTUP_EOF' > /tmp/startup-script.sh
+${c.startupScript}
+STARTUP_EOF
+
+# 2. Configure VPC Firewall for Google Cloud Health Checks & Load Balancer Probes
+gcloud compute firewall-rules create fw-allow-health-check-${c.migName} \\
+  --network="$NETWORK" \\
+  --action=ALLOW \\
+  --direction=INGRESS \\
+  --source-ranges="130.211.0.0/22,35.191.0.0/16" \\
+  --target-tags="${c.networkTag}" \\
+  --rules="tcp:${c.healthCheckPort}" || true
+
+# 3. Create Compute Engine Instance Template
+gcloud compute instance-templates create ${c.templateName} \\
+  --machine-type="${c.machineType}" \\
+  --network="$NETWORK" \\
+  --subnet="$SUBNET" \\
+  --region="$REGION" \\
+  --tags="${c.networkTag}" \\
+  --image-family="${c.sourceImageFamily}" \\
+  --image-project="${c.sourceImageProject}" \\
+  --boot-disk-size="${c.bootDiskSizeGb}GB" \\
+  --boot-disk-type="${c.bootDiskType}" \\${
+    c.enableShieldedVm
+      ? `\n  --shielded-secure-boot \\\n  --shielded-vtpm \\\n  --shielded-integrity-monitoring \\`
+      : ''
+  }
+  --scopes="${c.serviceAccountScopes}" \\
+  --metadata-from-file=startup-script=/tmp/startup-script.sh
+
+# 4. Create HTTP Health Check for Auto-Healing & Load Balancing
+gcloud compute health-checks create ${c.healthCheckProtocol.toLowerCase()} ${c.healthCheckName} \\
+  --port=${c.healthCheckPort} \\
+  --request-path="${c.healthCheckPath}" \\
+  --check-interval=${c.checkIntervalSec}s \\
+  --timeout=${c.timeoutSec}s \\
+  --healthy-threshold=${c.healthyThreshold} \\
+  --unhealthy-threshold=${c.unhealthyThreshold}
+
+# 5. Create Regional Managed Instance Group across 3 Availability Zones
+gcloud compute instance-groups managed create ${c.migName} \\
+  --template=${c.templateName} \\
+  --base-instance-name=${c.baseInstanceName} \\
+  --size=${c.minReplicas} \\
+  --zones="${zonesCsv}" \\
+  --health-check=${c.healthCheckName} \\
+  --initial-delay=90
+
+gcloud compute instance-groups managed set-named-ports ${c.migName} \\
+  --named-ports="http:${c.healthCheckPort}" \\
+  --region="$REGION"
+
+# 6. Configure Autoscaling Policy & Scale-In Protection
+gcloud compute instance-groups managed set-autoscaling ${c.migName} \\
+  --region="$REGION" \\
+  --min-num-replicas=${c.minReplicas} \\
+  --max-num-replicas=${c.maxReplicas} \\
+  ${autoscalingFlag} \\
+  --cool-down-period=${c.cooldownPeriodSec} \\
+  --scale-in-control=max-scaled-in-replicas=${c.scaleInControlMaxReduced},time-window=600
+
+# 7. Create Global Load Balancer Backend Service, URL Map & Forwarding Rule
+gcloud compute backend-services create ${c.lbName}-backend \\
+  --protocol=HTTP \\
+  --port-name=http \\
+  --health-checks=${c.healthCheckName} \\${
+    c.enableCloudCdn ? `\n  --enable-cdn \\` : ''
+  }
+  --session-affinity=${c.sessionAffinity} \\
+  --global
+
+gcloud compute backend-services add-backend ${c.lbName}-backend \\
+  --instance-group=${c.migName} \\
+  --instance-group-region="$REGION" \\
+  --balancing-mode=${c.autoscalingMetric === 'http-lb' ? 'RATE' : 'UTILIZATION'} \\
+  --max-rate-per-instance=${spec.maxRpsPerInstance} \\
+  --capacity-scaler=1.0 \\
+  --global
+
+gcloud compute url-maps create ${c.lbName}-url-map \\
+  --default-service=${c.lbName}-backend
+
+gcloud compute ${proxyResource} create ${c.lbName}-proxy \\
+  --url-map=${c.lbName}-url-map${
+    c.lbProtocol === 'HTTPS' ? ` \\\n  --ssl-certificates=${c.lbName}-managed-cert` : ''
+  }
+
+gcloud compute forwarding-rules create ${c.lbName}-forwarding-rule \\
+  --global \\
+  --target-${c.lbProtocol === 'HTTPS' ? 'https' : 'http'}-proxy=${c.lbName}-proxy \\
+  --ports=${forwardingPort}
+
+# 8. Deploy Cloud Monitoring Alert Policy
+gcloud alpha monitoring policies create --policy-from-file=/tmp/monitoring-alert.json
+`;
+}
+
+export function generateTerraformConfig(c: InfraConfig): string {
+  const spec = MACHINE_SPECS[c.machineType];
+  return `# Terraform Configuration for Google Cloud Scalable Infrastructure
+# Generated by CloudScale GCP Automation
+
+terraform {
+  required_version = ">= 1.6.0"
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 6.0"
+    }
+  }
+}
+
+provider "google" {
+  project = "${c.projectId}"
+  region  = "${c.region}"
+}
+
+resource "google_compute_firewall" "allow_health_check" {
+  name          = "fw-allow-health-check-${c.migName}"
+  network       = "${c.networkName}"
+  source_ranges = ["130.211.0.0/22", "35.191.0.0/16"]
+  target_tags   = ["${c.networkTag}"]
+
+  allow {
+    protocol = "tcp"
+    ports    = ["${c.healthCheckPort}"]
+  }
+}
+
+resource "google_compute_instance_template" "web_template" {
+  name_prefix  = "${c.templateName}-"
+  machine_type = "${c.machineType}"
+  region       = "${c.region}"
+  tags         = ["${c.networkTag}"]
+
+  disk {
+    source_image = "${c.sourceImageProject}/${c.sourceImageFamily}"
+    auto_delete  = true
+    boot         = true
+    disk_size_gb = ${c.bootDiskSizeGb}
+    disk_type    = "${c.bootDiskType}"
+  }
+
+  network_interface {
+    network    = "${c.networkName}"
+    subnetwork = "${c.subnetName}"
+  }
+${
+  c.enableShieldedVm
+    ? `
+  shielded_instance_config {
+    enable_secure_boot          = true
+    enable_vtpm                 = true
+    enable_integrity_monitoring = true
+  }`
+    : ''
+}
+
+  metadata_startup_script = <<-EOT
+${c.startupScript
+  .split('\n')
+  .map((line) => '    ' + line)
+  .join('\n')}
+  EOT
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "google_compute_health_check" "mig_health_check" {
+  name                = "${c.healthCheckName}"
+  check_interval_sec  = ${c.checkIntervalSec}
+  timeout_sec         = ${c.timeoutSec}
+  healthy_threshold   = ${c.healthyThreshold}
+  unhealthy_threshold = ${c.unhealthyThreshold}
+
+  http_health_check {
+    port         = ${c.healthCheckPort}
+    request_path = "${c.healthCheckPath}"
+  }
+}
+
+resource "google_compute_region_instance_group_manager" "regional_mig" {
+  name               = "${c.migName}"
+  base_instance_name = "${c.baseInstanceName}"
+  region             = "${c.region}"
+  distribution_policy_zones = [${c.zones.map((z) => `"${z}"`).join(', ')}]
+
+  version {
+    instance_template = google_compute_instance_template.web_template.id
+  }
+
+  named_port {
+    name = "http"
+    port = ${c.healthCheckPort}
+  }
+
+  auto_healing_policies {
+    health_check      = google_compute_health_check.mig_health_check.id
+    initial_delay_sec = 90
+  }
+
+  update_policy {
+    type                         = "PROACTIVE"
+    instance_redistribution_type = "PROACTIVE"
+    minimal_action               = "REPLACE"
+    max_surge_fixed              = ${c.maxSurge}
+    max_unavailable_fixed        = ${c.maxUnavailable}
+  }
+}
+
+resource "google_compute_region_autoscaler" "mig_autoscaler" {
+  name   = "${c.migName}-autoscaler"
+  region = "${c.region}"
+  target = google_compute_region_instance_group_manager.regional_mig.id
+
+  autoscaling_policy {
+    max_replicas    = ${c.maxReplicas}
+    min_replicas    = ${c.minReplicas}
+    cooldown_period = ${c.cooldownPeriodSec}
+${
+  c.autoscalingMetric === 'cpu'
+    ? `
+    cpu_utilization {
+      target = ${c.targetCpuUtilization.toFixed(2)}
+    }`
+    : `
+    load_balancing_utilization {
+      target = ${c.targetLbUtilization.toFixed(2)}
+    }`
+}
+
+    scale_in_control {
+      max_scaled_in_replicas {
+        fixed = ${c.scaleInControlMaxReduced}
+      }
+      time_window_sec = 600
+    }
+  }
+}
+
+resource "google_compute_backend_service" "global_backend" {
+  name                  = "${c.lbName}-backend"
+  protocol              = "HTTP"
+  port_name             = "http"
+  load_balancing_scheme = "EXTERNAL_MANAGED"
+  enable_cdn            = ${c.enableCloudCdn}
+  session_affinity      = "${c.sessionAffinity}"
+  health_checks         = [google_compute_health_check.mig_health_check.id]
+
+  backend {
+    group                 = google_compute_region_instance_group_manager.regional_mig.instance_group
+    balancing_mode        = "${c.autoscalingMetric === 'http-lb' ? 'RATE' : 'UTILIZATION'}"
+    max_rate_per_instance = ${spec.maxRpsPerInstance}
+    capacity_scaler       = 1.0
+  }
+}
+
+resource "google_compute_url_map" "default" {
+  name            = "${c.lbName}-url-map"
+  default_service = google_compute_backend_service.global_backend.id
+}
+
+resource "google_compute_target_${c.lbProtocol === 'HTTPS' ? 'https' : 'http'}_proxy" "default" {
+  name    = "${c.lbName}-proxy"
+  url_map = google_compute_url_map.default.id
+}
+
+resource "google_compute_global_forwarding_rule" "default" {
+  name                  = "${c.lbName}-forwarding-rule"
+  ip_protocol           = "TCP"
+  load_balancing_scheme = "EXTERNAL_MANAGED"
+  port_range            = "${c.lbProtocol === 'HTTPS' ? '443' : '80'}"
+  target                = google_compute_target_${c.lbProtocol === 'HTTPS' ? 'https' : 'http'}_proxy.default.id
+}
+
+resource "google_monitoring_alert_policy" "mig_cpu_alert" {
+  display_name = "${c.migName} High CPU & Latency Alert"
+  combiner     = "OR"
+
+  conditions {
+    display_name = "VM CPU Utilization > ${c.alertCpuThresholdPct}%"
+    condition_threshold {
+      filter          = "resource.type = \\"gce_instance\\" AND metric.type = \\"compute.googleapis.com/instance/cpu/utilization\\""
+      duration        = "180s"
+      comparison      = "COMPARISON_GT"
+      threshold_value = ${(c.alertCpuThresholdPct / 100).toFixed(2)}
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_MEAN"
+      }
+    }
+  }
+}
+`;
+}
+
+export function generateMonitoringAlertJson(c: InfraConfig): string {
+  const policy = {
+    displayName: `${c.migName} — Production SLO & Autoscaling Alert`,
+    documentation: {
+      content: `Triggered when Managed Instance Group ${c.migName} in ${c.region} exceeds CPU ${c.alertCpuThresholdPct}% or P95 latency ${c.alertLatencyMs}ms. Verify startup script logs in Cloud Logging.`,
+      mimeType: 'text/markdown',
+    },
+    combiner: 'OR',
+    conditions: [
+      {
+        displayName: `Compute Engine CPU Utilization > ${c.alertCpuThresholdPct}%`,
+        conditionThreshold: {
+          filter: `resource.type = "gce_instance" AND metadata.system_labels.instance_group = "${c.migName}" AND metric.type = "compute.googleapis.com/instance/cpu/utilization"`,
+          comparison: 'COMPARISON_GT',
+          thresholdValue: Number((c.alertCpuThresholdPct / 100).toFixed(2)),
+          duration: '180s',
+          aggregations: [
+            {
+              alignmentPeriod: '60s',
+              perSeriesAligner: 'ALIGN_MEAN',
+            },
+          ],
+        },
+      },
+      {
+        displayName: `HTTP(S) Load Balancer P95 Backend Latency > ${c.alertLatencyMs}ms`,
+        conditionThreshold: {
+          filter: `resource.type = "https_lb_rule" AND metric.type = "loadbalancing.googleapis.com/https/backend_latencies"`,
+          comparison: 'COMPARISON_GT',
+          thresholdValue: c.alertLatencyMs,
+          duration: '120s',
+          aggregations: [
+            {
+              alignmentPeriod: '60s',
+              perSeriesAligner: 'ALIGN_PERCENTILE_95',
+            },
+          ],
+        },
+      },
+    ],
+    notificationChannels: [`projects/${c.projectId}/notificationChannels/${c.notificationChannel}`],
+    enabled: true,
+  };
+
+  return JSON.stringify(policy, null, 2);
+}
